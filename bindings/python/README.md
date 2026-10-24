@@ -357,6 +357,41 @@ File-descriptor failures retain `DescriptorError`. Other execution checks may
 still raise the general `ExecutionError`. The [resource metadata contract](../../docs/EXECUTION_REQUEST_CONTRACT.md#resource-refusal-metadata)
 lists built-in budget origins and explains how to handle caller-defined origins.
 
+## DB-API (PEP 249)
+
+`hawdb.connect()` returns a PEP 249 connection for SQL. It takes the same
+arguments as `hawdb.open`, plus `autocommit`, and owns the database it opens.
+`connect` used to be another name for `open`; code that relied on that should
+call `open`, which keeps Cypher, named parameters and graph values. A
+connection holds its path like any handle, so close it before opening the same
+path with `open`.
+
+```python
+with hawdb.connect() as connection:
+    cursor = connection.cursor()
+    cursor.execute("CREATE TABLE trades (id BIGINT PRIMARY KEY, price DOUBLE PRECISION)")
+    cursor.executemany("INSERT INTO trades (id, price) VALUES ($1, $2)", [(1, 9.5), (2, 7.25)])
+    cursor.execute("SELECT id, price FROM trades WHERE id >= $1", [2])
+    print(cursor.description[1][:2])  # ('price', <class 'float'>)
+    print(cursor.fetchall())          # [(2, 7.25)]
+```
+
+Parameters bind by position to `$1`, `$2`, ... (`paramstyle` is
+`"numeric_dollar"`). Autocommit is off: statements, queries included, run in a
+transaction that `commit()` publishes and that `rollback()`, `close()` or an
+exception leaving the `with` block discards. A failed `executemany` rolls back
+the whole transaction, and the connection refuses further work until
+`rollback()`. Branch commands need `connect(..., autocommit=True)`, and
+read-only connections always autocommit. Use and close a connection on the
+thread that opened it.
+
+Rows are tuples. Until an engine fix, some query shapes, such as key lookups,
+`ORDER BY`, aggregates and `GROUP BY`, return their columns sorted by name, and
+report no columns at all when nothing matches. Read rows by the names in
+`description` rather than by SELECT-list position. `pandas.read_sql` works,
+with a warning that pandas only tests SQLAlchemy and sqlite3 connections, but
+it fails on such an empty result. `help(hawdb.dbapi)` gives the full contract.
+
 ## Pydantic rows (optional)
 
 The `pydantic` extra types the rows a statement returned and the parameters a

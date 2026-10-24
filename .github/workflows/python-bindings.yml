@@ -104,3 +104,11 @@ jobs:
         run: |
           python -c 'import pyarrow; print(pyarrow.__version__)'
           pytest tests/test_arrow_consumer.py
+
+      - name: Provision the optional pandas DB-API consumer
+        run: pip install "pandas==3.1.0"
+
+      - name: Test pandas.read_sql over the DB-API against the installed wheel
+        run: |
+          python -c 'import pandas; print(pandas.__version__)'
+          pytest tests/test_dbapi.py -k pandas

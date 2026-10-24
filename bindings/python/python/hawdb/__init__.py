@@ -31,18 +31,25 @@ from hawdb._hawdb import (
 )
 from hawdb._hawdb import exceptions
 
-connect = open
-
 
 def __getattr__(name):
-    # `hawdb.pydantic` needs the optional extra, so it loads on first use.
+    # `hawdb.pydantic` needs the optional extra, so it loads on first use, and
+    # so do `hawdb.dbapi` and its `connect`, which `import hawdb` does not need.
     # `hawdb.magic` is deliberately absent: importing it registers IPython
     # magics, so only an explicit import or `%load_ext` may load it.
-    if name == "pydantic":
+    if name in ("dbapi", "pydantic"):
         import importlib
 
-        return importlib.import_module("hawdb.pydantic")
+        return importlib.import_module(f"hawdb.{name}")
+    if name == "connect":
+        from hawdb.dbapi import connect
+
+        return connect
     raise AttributeError(f"module 'hawdb' has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted({*globals(), "connect", "dbapi"})
 
 
 __all__ = [
