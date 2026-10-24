@@ -1202,6 +1202,8 @@ impl PreparedRelationalExecutionDescriptor {
 #[derive(Debug)]
 pub struct PreparedRelationalSelect {
     pub statement: SelectStatement,
+    /// Output columns in SELECT-list order, named before join planning.
+    pub output_schema: hawdb_executor::QuerySchema,
     pub access_plan: PreparedRelationalAccessPlan,
     pub join_planning: RelationalJoinPlanningOutcome,
     pub execution: PreparedRelationalExecutionDescriptor,

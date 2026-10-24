@@ -75,6 +75,7 @@ pub(super) fn execute_select<'state>(
     execution: AdmittedRelationalExecution<'state, '_, impl RelationalQueryStoreReader>,
 ) -> Result<RelationalQueryOutput> {
     let select = &prepared.statement;
+    let output_schema = &prepared.output_schema;
     let join_planning = &prepared.join_planning;
     let default_cost_contexts = RelationalJoinCostContexts::default();
     let cost_contexts = execution
@@ -179,6 +180,7 @@ pub(super) fn execute_select<'state>(
     if prepared.execution.mode == PreparedRelationalExecutionMode::OrderedIndexProjection {
         let output = execute_ordered_index_projection(
             select,
+            output_schema,
             parameters,
             state,
             base_schema,
@@ -209,6 +211,7 @@ pub(super) fn execute_select<'state>(
     if prepared.execution.mode == PreparedRelationalExecutionMode::StreamingProjection {
         let mut output = execute_streaming_projection(
             select,
+            output_schema,
             parameters,
             state,
             base_schema,
@@ -243,6 +246,7 @@ pub(super) fn execute_select<'state>(
     if prepared.execution.mode == PreparedRelationalExecutionMode::Aggregate {
         let mut output = execute_aggregate_select(
             select,
+            output_schema,
             parameters,
             state,
             base_schema,
@@ -268,6 +272,7 @@ pub(super) fn execute_select<'state>(
 
     let mut output = execute_blocking_projection(
         select,
+        output_schema,
         parameters,
         state,
         base_schema,

@@ -17,9 +17,9 @@ use super::RelationalJoinPlanningContext;
 use super::{
     choose_base_access, choose_join_access, elapsed_nanos, measure_nanos,
     plan_relational_field_plan, projection_access_planning, projection_contains_aggregate,
-    reject_non_public_schema, resolve_relational_order_target,
+    reject_non_public_schema, resolve_relational_order_target, select_output_schema,
     validate_non_aggregate_coalesce_projections, HawDBError, Instant, PreparedRelationalAccessPlan,
-    PreparedRelationalExecutionDescriptor, PreparedRelationalSelect,
+    PreparedRelationalExecutionDescriptor, PreparedRelationalSelect, QuerySchema,
     RelationalAccessPathDescriptor, RelationalBaseAccessPlanning, RelationalQueryLimits,
     RelationalQueryReadModes, RelationalQueryResourceContext, RelationalQueryStoreReader,
     RelationalSqlStageTimings, RelationalState, Result, SelectStatement, Value,
@@ -138,7 +138,7 @@ pub(super) fn prepare_relational_select_with_snapshot(
     let join_planning = resources.join_planning;
     let prepare_started = Instant::now();
     let mut current_state_bind_nanos = 0;
-    measure_nanos(&mut current_state_bind_nanos, || -> Result<()> {
+    let output_schema = measure_nanos(&mut current_state_bind_nanos, || -> Result<QuerySchema> {
         reject_non_public_schema(select.from_table().schema.as_deref())?;
         if state.table_schema(&select.from_table().name).is_none() {
             return Err(HawDBError::Semantic(format!(
@@ -161,7 +161,8 @@ pub(super) fn prepare_relational_select_with_snapshot(
         for item in &select.order_by {
             resolve_relational_order_target(&select, item)?;
         }
-        Ok(())
+        // Join planning may reorder FROM and JOIN; wildcards keep syntax order.
+        select_output_schema(&select, state)
     })?;
     let default_task = RuntimeTaskContext::default();
     let snapshot = RelationalQueryRowPlanningSnapshot::open(
@@ -213,6 +214,7 @@ pub(super) fn prepare_relational_select_with_snapshot(
     let prepare_nanos = elapsed_nanos(prepare_started);
     let prepared = PreparedRelationalSelect {
         statement: planned.statement,
+        output_schema,
         access_plan,
         join_planning: planned.join_planning,
         execution,

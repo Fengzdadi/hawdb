@@ -221,7 +221,8 @@ fn assert_vector_queries(database: &mut Database) {
             .query_with_params(&cypher, &BTreeMap::from([("q".into(), query.clone())]))
             .unwrap()
             .rows;
-        assert_eq!(sql_rows, graph_rows, "{function}");
+        // Cypher still sorts RETURN columns by name, so compare rows by name.
+        assert_eq!(sql_rows, graph_rows.into_rows(), "{function}");
         assert_eq!(
             sql_rows
                 .iter()
@@ -252,7 +253,7 @@ fn assert_vector_queries(database: &mut Database) {
         .query("MATCH (n:VectorNode) RETURN n.id AS id, n.embedding AS embedding ORDER BY id")
         .unwrap()
         .rows;
-    assert_eq!(sql, graph);
+    assert_eq!(sql, graph.into_rows());
     assert_eq!(
         database
             .query("MATCH (n:VectorNode) RETURN n.id AS id ORDER BY id")
@@ -404,7 +405,8 @@ fn shared_vector_metrics_have_independent_ordering_oracles_and_tie_breaks() {
             "(:MetricRoot)-[:METRIC_LINK]->(n:MetricNode)",
         ] {
             let graph = database.query_with_params(&format!("MATCH {pattern} RETURN n.id AS id, {function}(n.embedding, $q) AS distance ORDER BY distance, id LIMIT 2"), &BTreeMap::from([("q".into(), vector_value(&[1.0, 0.0]))])).unwrap().rows;
-            assert_eq!(graph, sql);
+            // Cypher still sorts RETURN columns by name, so compare rows by name.
+            assert_eq!(sql, graph.into_rows());
         }
         assert_eq!(sql.len(), 2);
         for (row, (id, distance)) in sql.iter().zip(expected) {

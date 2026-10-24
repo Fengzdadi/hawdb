@@ -1603,6 +1603,25 @@ mod tests {
                 ("sequence".to_string(), Value::Int(2)),
             ])
         );
+        assert_eq!(output.schema().columns(), ["sequence", "payload"]);
+        let wildcard = database
+            .query_sql(
+                "SELECT * FROM public.events WHERE stream_id = 'thread-1' \
+                 ORDER BY sequence ASC LIMIT 1",
+            )
+            .expect("read strict append rows through a wildcard");
+        assert_eq!(
+            wildcard.schema().columns(),
+            ["stream_id", "sequence", "payload"]
+        );
+        let empty = database
+            .query_sql(
+                "SELECT sequence, payload FROM public.events WHERE stream_id = 'thread-2' \
+                 ORDER BY sequence ASC LIMIT 10",
+            )
+            .expect("read an empty strict append partition");
+        assert_eq!(empty.schema().columns(), ["sequence", "payload"]);
+        assert!(empty.value_rows().is_empty());
 
         let tables = database
             .query_sql(
@@ -2030,6 +2049,292 @@ mod tests {
             .expect("query empty positional result");
         assert_eq!(empty.schema().columns(), ["payload", "id"]);
         assert!(empty.value_rows().is_empty());
+    }
+
+    fn select_order_fixture() -> Database {
+        let mut database = Database::new();
+        for sql in [
+            "CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)",
+            "CREATE INDEX people_email_idx ON people (email)",
+            "CREATE TABLE badges (badge_id BIGINT PRIMARY KEY, \
+             person_id BIGINT NOT NULL REFERENCES people(id), label TEXT NOT NULL)",
+            "CREATE INDEX badges_person_idx ON badges (person_id, badge_id)",
+            "INSERT INTO people (id, name, email) \
+             VALUES (1, 'ada', 'ada@example.com'), (2, 'bob', 'bob@example.com')",
+            "INSERT INTO badges (badge_id, person_id, label) VALUES (10, 1, 'gold')",
+        ] {
+            database.query_sql(sql).expect(sql);
+        }
+        database
+    }
+
+    #[test]
+    fn database_sql_keeps_select_order_and_empty_schema_on_every_execution_path() {
+        let mut database = select_order_fixture();
+        let text = |value: &str| Value::String(value.to_string());
+        // Every shape names its columns out of sorted order, and the second
+        // statement of each pair matches no row. The EXPLAIN plan pins the
+        // execution path, so a planner change cannot move a case silently.
+        // (statement, statement matching no row, plan, columns, first row)
+        type Case<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [Value]);
+        let cases: &[Case<'_>] = &[
+            // Borrowed full scans, which bind their own schema.
+            (
+                "SELECT name, id FROM people",
+                "SELECT name, id FROM people WHERE name = 'nobody'",
+                "ProjectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT name, id FROM people WHERE id > 0",
+                "SELECT name, id FROM people WHERE id > 99",
+                "ProjectionExec > SelectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT name, id FROM people LIMIT 1",
+                "SELECT name, id FROM people LIMIT 0",
+                "LimitExec > ProjectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT * FROM people",
+                "SELECT * FROM people WHERE name = 'nobody'",
+                "ProjectionExec > TableFullScanExec",
+                &["id", "name", "email"],
+                &[Value::Int(1), text("ada"), text("ada@example.com")],
+            ),
+            // Key and index lookups, joins and scalar functions.
+            (
+                "SELECT name, id FROM people WHERE id = 1",
+                "SELECT name, id FROM people WHERE id = 99",
+                "ProjectionExec > TablePointGetExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT name, id FROM people WHERE email = 'ada@example.com'",
+                "SELECT name, id FROM people WHERE email = 'nobody@example.com'",
+                "ProjectionExec > IndexRangeScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT b.label, p.name, p.id FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id",
+                "SELECT b.label, p.name, p.id FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id WHERE b.label = 'none'",
+                "ProjectionExec > BatchedIndexNestedLoopJoinExec > TableFullScanExec",
+                &["label", "name", "id"],
+                &[text("gold"), text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT * FROM people AS p INNER JOIN badges AS b ON b.person_id = p.id",
+                "SELECT * FROM people AS p INNER JOIN badges AS b ON b.person_id = p.id \
+                 WHERE b.label = 'none'",
+                "ProjectionExec > BatchedIndexNestedLoopJoinExec > TableFullScanExec",
+                &["id", "name", "email", "badge_id", "person_id", "label"],
+                &[
+                    Value::Int(1),
+                    text("ada"),
+                    text("ada@example.com"),
+                    Value::Int(10),
+                    Value::Int(1),
+                    text("gold"),
+                ],
+            ),
+            (
+                "SELECT * FROM people AS p LEFT JOIN badges AS b ON b.person_id = p.id \
+                 WHERE p.id = 2",
+                "SELECT * FROM people AS p LEFT JOIN badges AS b ON b.person_id = p.id \
+                 WHERE p.id = 99",
+                "ProjectionExec > NestedLoopLeftJoinExec > TablePointGetExec",
+                &["id", "name", "email", "badge_id", "person_id", "label"],
+                &[
+                    Value::Int(2),
+                    text("bob"),
+                    text("bob@example.com"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            ),
+            (
+                "SELECT coalesce(name, 'none') AS shown, id FROM people",
+                "SELECT coalesce(name, 'none') AS shown, id FROM people WHERE name = 'nobody'",
+                "ProjectionExec > TableFullScanExec",
+                &["shown", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            // Index-ordered projection.
+            (
+                "SELECT label, badge_id FROM badges WHERE person_id = 1 ORDER BY badge_id",
+                "SELECT label, badge_id FROM badges WHERE person_id = 2 ORDER BY badge_id",
+                "ProjectionExec > IndexRangeScanExec",
+                &["label", "badge_id"],
+                &[text("gold"), Value::Int(10)],
+            ),
+            // Blocking top-N, DISTINCT and expression-alias ordering.
+            (
+                "SELECT name, id FROM people ORDER BY id",
+                "SELECT name, id FROM people WHERE id > 99 ORDER BY id",
+                "TopNExec > ProjectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT b.label, p.name FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id ORDER BY p.name",
+                "SELECT b.label, p.name FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id \
+                 WHERE b.label = 'none' ORDER BY p.name",
+                "TopNExec > ProjectionExec > BatchedIndexNestedLoopJoinExec > TableFullScanExec",
+                &["label", "name"],
+                &[text("gold"), text("ada")],
+            ),
+            // LIMIT 0 returns before the blocking operator runs.
+            (
+                "SELECT name, id FROM people ORDER BY id LIMIT 1",
+                "SELECT name, id FROM people ORDER BY id LIMIT 0",
+                "LimitExec > TopNExec > ProjectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT DISTINCT name, id FROM people WHERE id = 1",
+                "SELECT DISTINCT name, id FROM people WHERE id = 99",
+                "DistinctExec > ProjectionExec > TablePointGetExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT DISTINCT name, id FROM people ORDER BY name",
+                "SELECT DISTINCT name, id FROM people WHERE name = 'nobody' ORDER BY name",
+                "TopNExec > DistinctExec > ProjectionExec > TableFullScanExec",
+                &["name", "id"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT coalesce(name, 'none') AS shown, id FROM people ORDER BY shown DESC",
+                "SELECT coalesce(name, 'none') AS shown, id FROM people \
+                 WHERE name = 'nobody' ORDER BY shown DESC",
+                "TopNExec > ProjectionExec > TableFullScanExec",
+                &["shown", "id"],
+                &[text("bob"), Value::Int(2)],
+            ),
+            // Columnar, row-at-a-time and grouped aggregates.
+            (
+                "SELECT sum(id) AS total, count(*) AS n FROM people",
+                "SELECT sum(id) AS total, count(*) AS n FROM people OFFSET 1",
+                "RelationalAggregateExec > ProjectionExec > TableFullScanExec",
+                &["total", "n"],
+                &[Value::Int(3), Value::Int(2)],
+            ),
+            (
+                "SELECT count(*) AS n, max(id) AS m FROM people",
+                "SELECT count(*) AS n, max(id) AS m FROM people HAVING count(*) > 99",
+                "RelationalAggregateExec > ProjectionExec > TableFullScanExec",
+                &["n", "m"],
+                &[Value::Int(2), Value::Int(2)],
+            ),
+            (
+                "SELECT count(*) AS n, max(p.id) AS m FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id",
+                "SELECT count(*) AS n, max(p.id) AS m FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id HAVING count(*) > 99",
+                "RelationalAggregateExec > ProjectionExec > BatchedIndexNestedLoopJoinExec \
+                 > TableFullScanExec",
+                &["n", "m"],
+                &[Value::Int(1), Value::Int(1)],
+            ),
+            (
+                "SELECT name, count(*) AS c FROM people GROUP BY name",
+                "SELECT name, count(*) AS c FROM people WHERE id > 99 GROUP BY name",
+                "RelationalAggregateExec > SortExec > ProjectionExec > TableFullScanExec",
+                &["name", "c"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT name, count(*) AS c FROM people GROUP BY name HAVING count(*) > 0",
+                "SELECT name, count(*) AS c FROM people GROUP BY name HAVING count(*) > 99",
+                "SelectionExec > RelationalAggregateExec > SortExec > ProjectionExec \
+                 > TableFullScanExec",
+                &["name", "c"],
+                &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT b.label, count(*) AS n FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id GROUP BY b.label",
+                "SELECT b.label, count(*) AS n FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id \
+                 WHERE b.label = 'none' GROUP BY b.label",
+                "RelationalAggregateExec > SortExec > ProjectionExec \
+                 > BatchedIndexNestedLoopJoinExec > TableFullScanExec",
+                &["label", "n"],
+                &[text("gold"), Value::Int(1)],
+            ),
+        ];
+        for (matching, empty, plan, columns, first_row) in cases {
+            let explained = database
+                .query_sql(&format!("EXPLAIN {matching}"))
+                .expect(matching);
+            assert_eq!(
+                relational_explain_operators(&explained).join(" > "),
+                *plan,
+                "{matching}"
+            );
+            let output = database.query_sql(matching).expect(matching);
+            assert_eq!(output.schema().columns(), *columns, "{matching}");
+            assert_eq!(output.value_rows().next(), Some(*first_row), "{matching}");
+            let output = database.query_sql(empty).expect(empty);
+            assert_eq!(output.schema().columns(), *columns, "{empty}");
+            assert!(output.value_rows().is_empty(), "{empty}");
+        }
+
+        // These always return exactly one row.
+        let fromless = database
+            .query_sql("SELECT 2 AS z, 1 AS a")
+            .expect("FROM-less SELECT");
+        assert_eq!(fromless.schema().columns(), ["z", "a"]);
+        assert_eq!(
+            fromless.value_rows().collect::<Vec<_>>(),
+            vec![&[Value::Int(2), Value::Int(1)][..]]
+        );
+        let distinct = database
+            .query_sql("SELECT count(DISTINCT name) FROM people")
+            .expect("COUNT DISTINCT");
+        assert_eq!(distinct.schema().columns(), ["count"]);
+        assert_eq!(
+            distinct.value_rows().collect::<Vec<_>>(),
+            vec![&[Value::Int(2)][..]]
+        );
+    }
+
+    #[test]
+    fn database_sql_rejects_repeated_output_names_before_reading_rows() {
+        let mut database = select_order_fixture();
+        // A result schema cannot repeat a name, so preparation rejects these
+        // even when no row matches, and EXPLAIN rejects them too.
+        for (sql, column) in [
+            ("SELECT name AS x, id AS x FROM people WHERE id = 99", "x"),
+            (
+                "SELECT * FROM people AS p INNER JOIN people AS q ON q.id = p.id WHERE p.id = 99",
+                "id",
+            ),
+            ("SELECT count(*), count(email) FROM people", "count"),
+            ("EXPLAIN SELECT name AS x, id AS x FROM people", "x"),
+        ] {
+            let error = database.query_sql(sql).expect_err(sql);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("duplicate output column {column}")),
+                "{sql}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3339,6 +3644,23 @@ mod tests {
         );
         assert_eq!(wildcard.output.rows, syntax.output.rows);
         assert_eq!(wildcard.output.schema(), syntax.output.schema());
+        assert_eq!(
+            wildcard.output.schema().columns(),
+            ["parent_id", "parent_name", "child_id", "parent_ref"]
+        );
+        let empty = read
+            .query_sql_with_params_options_profiled(
+                "SELECT * FROM wildcard_parents AS p INNER JOIN wildcard_children AS c ON c.parent_ref = p.parent_id WHERE c.child_id = 99",
+                &[],
+                crate::QueryStreamOptions::default(),
+            )
+            .expect("plan empty unordered wildcard join");
+        assert_eq!(empty.profile.join_planning.selected_order, ["c", "p"]);
+        assert_eq!(
+            empty.output.schema().columns(),
+            ["parent_id", "parent_name", "child_id", "parent_ref"]
+        );
+        assert!(empty.output.rows.is_empty());
 
         let projected = read
             .query_sql_with_params_options_profiled(
@@ -3888,6 +4210,21 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("EXPLAIN output has no {operator} row: {:?}", output.rows))
+    }
+
+    /// Operator names of a relational EXPLAIN, root first, without tree glyphs.
+    fn relational_explain_operators(output: &crate::QueryOutput) -> Vec<&str> {
+        output
+            .rows
+            .iter()
+            .filter_map(|row| match row.get("id") {
+                Some(Value::String(id)) => id
+                    .trim_start_matches([' ', '└', '├', '│', '─'])
+                    .split('_')
+                    .next(),
+                _ => None,
+            })
+            .collect()
     }
 
     fn relational_explain_execution_info(output: &crate::QueryOutput) -> &str {

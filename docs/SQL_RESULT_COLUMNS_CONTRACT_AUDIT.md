@@ -10,9 +10,12 @@ satisfy the first example when both tables expose `id`.
 `crates/executor/src/profile.rs` defines `Row` as `BTreeMap<String, Value>`.
 `QuerySchema::try_new` rejects duplicate column names. `QueryRow::get`, string
 indexing and `QueryRowRef::to_owned_row` rely on that unique-name contract.
-`src/relational_sql/query/expression.rs::project_bound_row` builds a Row and
-rejects duplicate names before constructing QueryRows. SQL rows are also
-materialized through map-based aggregate and blocking-projection paths.
+`crates/relational/src/query/expression.rs::select_output_schema` names the
+SELECT output during preparation and rejects duplicate names before any row is
+read, so such a statement fails even when no row matches, and so does its
+EXPLAIN. `project_bound_row` and the map-based aggregate and blocking-projection
+paths still build name-keyed rows, which `QueryRows::try_from_named_rows` orders
+by that schema.
 
 For tables `a(id, value_a)` and `b(id, value_b)`, PostgreSQL retains both `id`
 columns in distinct result positions. A map cannot represent that schema. Letting

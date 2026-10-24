@@ -17,16 +17,17 @@ use super::{
     projection_uses_non_aggregate_scalar_function, visit_relational_rows,
     AccountedRelationalLocatorBatch, BatchControl, Binding, BindingId, BoundRow,
     BoundStreamingPredicate, BoundStreamingProjection, ColumnarBatch, HawDBError, PlannedJoin,
-    QueryMemoryLedger, QueryRowsBuilder, RelationalBaseAccess, RelationalIndexRuntime,
-    RelationalOperatorId, RelationalPhysicalJoinExecution, RelationalPipelineState,
-    RelationalQueryLimits, RelationalRowLocator, RelationalRowRuntime, RelationalState,
-    RelationalTableSchema, Result, SelectStatement, StreamingProjectionOutput, Value,
-    RELATIONAL_ROW_LOCATOR_SLOT,
+    QueryMemoryLedger, QueryRows, QueryRowsBuilder, QuerySchema, RelationalBaseAccess,
+    RelationalIndexRuntime, RelationalOperatorId, RelationalPhysicalJoinExecution,
+    RelationalPipelineState, RelationalQueryLimits, RelationalRowLocator, RelationalRowRuntime,
+    RelationalState, RelationalTableSchema, Result, SelectStatement, StreamingProjectionOutput,
+    Value, RELATIONAL_ROW_LOCATOR_SLOT,
 };
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_ordered_index_projection<'a>(
     select: &'a SelectStatement,
+    output_schema: &QuerySchema,
     parameters: &[Value],
     state: &'a RelationalState,
     base_schema: &'a RelationalTableSchema,
@@ -165,7 +166,7 @@ pub(super) fn execute_ordered_index_projection<'a>(
         locator_batch.emit(&mut hydrate)?;
     }
     Ok(StreamingProjectionOutput {
-        rows: output.into(),
+        rows: QueryRows::try_from_named_rows(output_schema.clone(), output)?,
         blocking_operator_memory_reports: Vec::new(),
     })
 }
@@ -173,6 +174,7 @@ pub(super) fn execute_ordered_index_projection<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_streaming_projection<'a>(
     select: &'a SelectStatement,
+    output_schema: &QuerySchema,
     parameters: &[Value],
     state: &'a RelationalState,
     base_schema: &'a RelationalTableSchema,
@@ -277,7 +279,7 @@ pub(super) fn execute_streaming_projection<'a>(
         )?;
     }
     Ok(StreamingProjectionOutput {
-        rows: output.into(),
+        rows: QueryRows::try_from_named_rows(output_schema.clone(), output)?,
         blocking_operator_memory_reports: Vec::new(),
     })
 }

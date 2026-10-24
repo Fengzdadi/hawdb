@@ -627,7 +627,7 @@ impl Database {
                     max_payload_bytes.unwrap_or(usize::MAX),
                 )?;
                 return Ok(QueryOutput {
-                    rows: project_append_rows(&plan, &output.rows)?.into(),
+                    rows: project_append_rows(&plan, &output.rows)?,
                 });
             }
             if let Some(plan) = compile_prepared_append_explain_sql(

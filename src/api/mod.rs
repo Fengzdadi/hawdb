@@ -21152,7 +21152,7 @@ pub(super) fn execute_database_transaction_prepared_sql(
             max_read_result_payload_bytes.unwrap_or(usize::MAX),
         )?;
         return Ok(sql_query_result(QueryOutput {
-            rows: crate::relational_sql::project_append_rows(&plan, &output.rows)?.into(),
+            rows: crate::relational_sql::project_append_rows(&plan, &output.rows)?,
         }));
     }
     if let Some(plan) = crate::relational_sql::compile_prepared_append_explain_sql(
@@ -23135,7 +23135,7 @@ where
             )?;
             query_runtime::query_runtime_checkpoint(Some(task_context))?;
             return Ok(QueryOutput {
-                rows: crate::relational_sql::project_append_rows(&plan, &output.rows)?.into(),
+                rows: crate::relational_sql::project_append_rows(&plan, &output.rows)?,
             });
         }
         if let Some(plan) = crate::relational_sql::compile_prepared_append_explain_sql(

@@ -20,8 +20,8 @@ use super::{
     typed_row_set_locator, visit_relational_rows, with_typed_locator_bound_row_mode,
     AggregateProjectionState, BTreeMap, BatchControl, BlockingExecutionContext, Catalog,
     ColumnarAggregateExecutor, DistinctAggregateValueBatchSource, ExecutionLimit, ExternalTopN,
-    HawDBError, OperatorMemoryTracker, PlannedJoin, QueryMemoryClass, QueryMemoryLedger,
-    RelationalAccessPathDescriptor, RelationalBaseAccess, RelationalBlockingObserver,
+    HawDBError, OperatorMemoryTracker, PlannedJoin, QueryMemoryClass, QueryMemoryLedger, QueryRows,
+    QuerySchema, RelationalAccessPathDescriptor, RelationalBaseAccess, RelationalBlockingObserver,
     RelationalIndexRuntime, RelationalJoinPlanningOutcome, RelationalPhysicalJoinExecution,
     RelationalPipelineState, RelationalQueryLimits, RelationalQueryOutput, RelationalRowRuntime,
     RelationalSortKey, RelationalSortRecord, RelationalSqlStageTimings, RelationalState,
@@ -33,6 +33,7 @@ pub(super) use crate::field_plan::single_count_distinct_column;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_aggregate_select<'a>(
     select: &'a SelectStatement,
+    output_schema: &QuerySchema,
     parameters: &'a [Value],
     state: &'a RelationalState,
     base_schema: &'a RelationalTableSchema,
@@ -56,6 +57,7 @@ pub(super) fn execute_aggregate_select<'a>(
     if let Some((column, output_name, filter)) = single_count_distinct_column(select) {
         return execute_single_count_distinct(
             select,
+            output_schema,
             column,
             output_name,
             filter,
@@ -80,6 +82,7 @@ pub(super) fn execute_aggregate_select<'a>(
     if !select.group_by.is_empty() {
         return execute_grouped_aggregate(
             select,
+            output_schema,
             parameters,
             state,
             base_schema,
@@ -172,7 +175,7 @@ pub(super) fn execute_aggregate_select<'a>(
             rows.push(row);
         }
         return Ok(RelationalQueryOutput {
-            rows: rows.into(),
+            rows: QueryRows::try_from_named_rows(output_schema.clone(), rows)?,
             stage_timings: RelationalSqlStageTimings::default(),
             join_planning: join_planning.clone(),
             operator_cardinality_profiles: pipeline.operator_cardinality_profiles(),
@@ -311,7 +314,7 @@ pub(super) fn execute_aggregate_select<'a>(
         ));
     }
     Ok(RelationalQueryOutput {
-        rows: output.into(),
+        rows: QueryRows::try_from_named_rows(output_schema.clone(), output)?,
         stage_timings: RelationalSqlStageTimings::default(),
         join_planning: join_planning.clone(),
         operator_cardinality_profiles: pipeline.operator_cardinality_profiles(),
@@ -334,6 +337,7 @@ pub(super) fn execute_aggregate_select<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_single_count_distinct<'a>(
     select: &'a SelectStatement,
+    output_schema: &QuerySchema,
     column: &'a SqlColumnRef,
     output_name: String,
     filter: Option<&'a SqlPredicate>,
@@ -419,7 +423,7 @@ pub(super) fn execute_single_count_distinct<'a>(
         ));
     }
     Ok(RelationalQueryOutput {
-        rows: vec![row].into(),
+        rows: QueryRows::try_from_named_rows(output_schema.clone(), vec![row])?,
         stage_timings: RelationalSqlStageTimings::default(),
         join_planning: join_planning.clone(),
         operator_cardinality_profiles: pipeline.operator_cardinality_profiles(),
@@ -436,6 +440,7 @@ pub(super) fn execute_single_count_distinct<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_grouped_aggregate<'a>(
     select: &'a SelectStatement,
+    output_schema: &QuerySchema,
     parameters: &'a [Value],
     state: &'a RelationalState,
     base_schema: &'a RelationalTableSchema,
@@ -610,7 +615,7 @@ pub(super) fn execute_grouped_aggregate<'a>(
         execution_memory,
     ));
     Ok(RelationalQueryOutput {
-        rows: output.into(),
+        rows: QueryRows::try_from_named_rows(output_schema.clone(), output)?,
         stage_timings: RelationalSqlStageTimings::default(),
         join_planning: join_planning.clone(),
         operator_cardinality_profiles: pipeline.operator_cardinality_profiles(),

@@ -14,6 +14,7 @@
 
 use crate::{bind_relational_value, compile_column, reject_non_public_schema};
 use hawdb_core::{HawDBError, Result, Value};
+use hawdb_executor::{QueryRows, QueryRowsBuilder, QuerySchema};
 use hawdb_sql::{
     CreateTableStatement, PreparedPostgresStatement, SelectProjection, SelectStatement, SqlBound,
     SqlComparisonOp, SqlGeneratedOrder, SqlNullOrder, SqlOrderDirection, SqlPredicate,
@@ -592,28 +593,24 @@ fn compile_append_projection(
     Ok(output)
 }
 
-pub fn project_append_rows(
-    plan: &AppendSelectPlan,
-    rows: &[AppendTableRow],
-) -> Result<Vec<std::collections::BTreeMap<String, Value>>> {
-    rows.iter()
-        .map(|row| {
-            plan.projection
-                .iter()
-                .map(|projection| {
-                    let value = row.row.values().get(projection.position).ok_or_else(|| {
-                        HawDBError::StorageIntegrity(
-                            "strict append row does not match its table schema".to_string(),
-                        )
-                    })?;
-                    Ok((
-                        projection.output_name.clone(),
-                        append_value_to_value(value)?,
-                    ))
-                })
-                .collect()
-        })
-        .collect()
+pub fn project_append_rows(plan: &AppendSelectPlan, rows: &[AppendTableRow]) -> Result<QueryRows> {
+    let schema = QuerySchema::try_new(
+        plan.projection
+            .iter()
+            .map(|projection| projection.output_name.clone()),
+    )?;
+    let mut output = QueryRowsBuilder::with_schema(schema, rows.len());
+    for row in rows {
+        output.try_push_values(plan.projection.iter().map(|projection| {
+            let value = row.row.values().get(projection.position).ok_or_else(|| {
+                HawDBError::StorageIntegrity(
+                    "strict append row does not match its table schema".to_string(),
+                )
+            })?;
+            append_value_to_value(value)
+        }))?;
+    }
+    Ok(output.finish())
 }
 
 pub fn format_append_explain(

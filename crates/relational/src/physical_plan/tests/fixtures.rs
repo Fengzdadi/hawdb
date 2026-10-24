@@ -197,6 +197,7 @@ pub(super) fn prepared(
         PreparedRelationalExecutionDescriptor::prepare(&statement, &access_plan).unwrap();
     PreparedRelationalSelect {
         statement,
+        output_schema: hawdb_executor::QuerySchema::empty(),
         access_plan,
         join_planning: RelationalJoinPlanningOutcome::explicit_syntax_order(
             vec!["l".into(), "r".into()],

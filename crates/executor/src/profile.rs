@@ -280,6 +280,31 @@ impl QueryRows {
         Self::from_flat_values_unchecked(QuerySchema::empty(), Vec::new(), 0)
     }
 
+    /// Builds rows whose columns follow `schema` rather than map key order.
+    ///
+    /// The schema is kept when `rows` is empty. Each row must name exactly the
+    /// schema's columns: a missing column fails instead of reading as NULL.
+    pub fn try_from_named_rows(schema: QuerySchema, rows: Vec<Row>) -> Result<Self> {
+        let mut builder = QueryRowsBuilder::with_schema(schema.clone(), rows.len());
+        for (ordinal, mut row) in rows.into_iter().enumerate() {
+            if row.len() != schema.len() {
+                return Err(HawDBError::Execution(format!(
+                    "query result row {ordinal} has width {}, expected {}",
+                    row.len(),
+                    schema.len()
+                )));
+            }
+            builder.try_push_values(schema.columns().iter().map(|column| {
+                row.remove(column).ok_or_else(|| {
+                    HawDBError::Execution(format!(
+                        "query result row {ordinal} has no column {column}"
+                    ))
+                })
+            }))?;
+        }
+        Ok(builder.finish())
+    }
+
     fn from_flat_values_unchecked(
         schema: QuerySchema,
         values: Vec<Value>,
@@ -1080,6 +1105,44 @@ mod tests {
         assert_eq!(rows.clone().into_rows(), expected);
         drop(rows);
         assert_eq!(handle["id"], Value::Int(256));
+    }
+
+    #[test]
+    fn named_rows_follow_the_declared_schema_even_when_empty() {
+        let schema = QuerySchema::try_new(["name".to_string(), "id".to_string()]).unwrap();
+        let rows = QueryRows::try_from_named_rows(
+            schema.clone(),
+            vec![Row::from([
+                ("id".into(), Value::Int(1)),
+                ("name".into(), Value::String("one".into())),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(rows.schema(), &schema);
+        assert_eq!(
+            rows.value_rows().collect::<Vec<_>>(),
+            vec![&[Value::String("one".into()), Value::Int(1)][..]]
+        );
+
+        let empty = QueryRows::try_from_named_rows(schema.clone(), Vec::new()).unwrap();
+        assert_eq!(empty.schema(), &schema);
+        assert!(empty.is_empty());
+
+        for (row, message) in [
+            (
+                Row::from([("id".into(), Value::Int(1))]),
+                "query result row 0 has width 1, expected 2",
+            ),
+            (
+                Row::from([("id".into(), Value::Int(1)), ("title".into(), Value::Null)]),
+                "query result row 0 has no column name",
+            ),
+        ] {
+            assert_eq!(
+                QueryRows::try_from_named_rows(schema.clone(), vec![row]),
+                Err(HawDBError::Execution(message.to_string()))
+            );
+        }
     }
 
     #[test]

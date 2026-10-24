@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use super::{
-    projection_contains_aggregate, Binding, BoundRow, HawDBError, RelationalScalarType,
-    RelationalState, RelationalValue, Result, Row, SelectProjection, SelectStatement, SqlColumnRef,
-    SqlExpression, SqlFunctionArgument, SqlPredicate, SqlValue, Value,
+    projection_contains_aggregate, BTreeSet, Binding, BoundRow, HawDBError, QuerySchema,
+    RelationalScalarType, RelationalState, RelationalValue, Result, Row, SelectProjection,
+    SelectStatement, SqlColumnRef, SqlExpression, SqlFunctionArgument, SqlPredicate, SqlValue,
+    Value,
 };
 use crate::predicate::predicate_truth_with;
 pub(super) use crate::query_value::{
@@ -274,6 +275,44 @@ pub(super) fn resolve_column_with_type<'a>(
         binding.value(position)?,
         binding.schema.columns[position].scalar_type,
     ))
+}
+
+/// Names the SELECT output columns in SELECT-list order.
+///
+/// The names match those `project_bound_row` and the aggregate states give
+/// each row. A wildcard expands FROM and then each JOIN in syntax order, so
+/// this must run before the join planner can reorder the relations.
+pub(super) fn select_output_schema(
+    select: &SelectStatement,
+    state: &RelationalState,
+) -> Result<QuerySchema> {
+    let mut columns = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        match item {
+            SelectProjection::Wildcard => {
+                for table in select
+                    .from
+                    .iter()
+                    .chain(select.joins.iter().map(|join| &join.table))
+                {
+                    let schema = state.table_schema(&table.name).ok_or_else(|| {
+                        HawDBError::Semantic(format!("unknown relational table {}", table.name))
+                    })?;
+                    columns.extend(schema.columns.iter().map(|column| column.name.clone()));
+                }
+            }
+            SelectProjection::Expression { expression, alias } => {
+                columns.push(alias.clone().unwrap_or_else(|| expression_name(expression)));
+            }
+        }
+    }
+    let mut names = BTreeSet::new();
+    if let Some(duplicate) = columns.iter().find(|column| !names.insert(column.as_str())) {
+        return Err(HawDBError::Semantic(format!(
+            "relational projection contains duplicate output column {duplicate}"
+        )));
+    }
+    QuerySchema::try_new(columns)
 }
 
 pub(super) fn project_bound_row(
