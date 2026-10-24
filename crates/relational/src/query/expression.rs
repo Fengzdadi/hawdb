@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::projection::RELATIONAL_SORT_COLUMN_PREFIX;
 use super::{
     projection_contains_aggregate, BTreeSet, Binding, BoundRow, HawDBError, QuerySchema,
     RelationalScalarType, RelationalState, RelationalValue, Result, Row, SelectProjection,
@@ -281,8 +282,10 @@ pub(super) fn resolve_column_with_type<'a>(
 ///
 /// The names match those `project_bound_row` and the aggregate states give
 /// each row. A wildcard expands FROM and then each JOIN in syntax order, so
-/// this must run before the join planner can reorder the relations.
-pub(super) fn select_output_schema(
+/// this must run before the join planner can reorder the relations. Repeated
+/// names and the internal sort-key prefix are refused; blocking projection
+/// strips that prefix from its rows.
+pub(crate) fn select_output_schema(
     select: &SelectStatement,
     state: &RelationalState,
 ) -> Result<QuerySchema> {
@@ -307,10 +310,18 @@ pub(super) fn select_output_schema(
         }
     }
     let mut names = BTreeSet::new();
-    if let Some(duplicate) = columns.iter().find(|column| !names.insert(column.as_str())) {
-        return Err(HawDBError::Semantic(format!(
-            "relational projection contains duplicate output column {duplicate}"
-        )));
+    for column in &columns {
+        if column.starts_with(RELATIONAL_SORT_COLUMN_PREFIX) {
+            return Err(HawDBError::Semantic(format!(
+                "relational projection output column {column} uses the reserved prefix \
+                 {RELATIONAL_SORT_COLUMN_PREFIX}"
+            )));
+        }
+        if !names.insert(column.as_str()) {
+            return Err(HawDBError::Semantic(format!(
+                "relational projection contains duplicate output column {column}"
+            )));
+        }
     }
     QuerySchema::try_new(columns)
 }

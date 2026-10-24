@@ -17,6 +17,15 @@ EXPLAIN. `project_bound_row` and the map-based aggregate and blocking-projection
 paths still build name-keyed rows, which `QueryRows::try_from_named_rows` orders
 by that schema.
 
+Refusing repeated names during preparation is a deliberate behavior change
+([#1225](https://github.com/nowledge-co/hawdb/issues/1225)). Before it, the
+columnar aggregate collapsed `SELECT count(*), count(email) FROM t` into one
+`count` column, and `SELECT a AS x, b AS x FROM t WHERE false` returned an
+empty result with no columns. PostgreSQL accepts both. HawDB refuses them for as
+long as result rows are keyed by name. The same check refuses output names
+that start with the internal sort-key prefix `__hawdb_relational_sort_`, which
+blocking projection strips from its rows.
+
 For tables `a(id, value_a)` and `b(id, value_b)`, PostgreSQL retains both `id`
 columns in distinct result positions. A map cannot represent that schema. Letting
 one overwrite the other loses data; renaming them to `a.id` and `b.id` changes

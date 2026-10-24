@@ -2186,6 +2186,47 @@ mod tests {
                 &[text("ada"), Value::Int(1)],
             ),
             (
+                "SELECT name, email FROM people ORDER BY id",
+                "SELECT name, email FROM people WHERE id > 99 ORDER BY id",
+                "TopNExec > ProjectionExec > TableFullScanExec",
+                &["name", "email"],
+                &[text("ada"), text("ada@example.com")],
+            ),
+            (
+                "SELECT * FROM people ORDER BY name DESC",
+                "SELECT * FROM people WHERE name = 'nobody' ORDER BY name DESC",
+                "TopNExec > ProjectionExec > TableFullScanExec",
+                &["id", "name", "email"],
+                &[Value::Int(2), text("bob"), text("bob@example.com")],
+            ),
+            (
+                "SELECT p.name, b.label FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id ORDER BY b.badge_id",
+                "SELECT p.name, b.label FROM people AS p \
+                 INNER JOIN badges AS b ON b.person_id = p.id \
+                 WHERE b.label = 'none' ORDER BY b.badge_id",
+                "TopNExec > ProjectionExec > BatchedIndexNestedLoopJoinExec > TableFullScanExec",
+                &["name", "label"],
+                &[text("ada"), text("gold")],
+            ),
+            (
+                "SELECT * FROM people AS p LEFT JOIN badges AS b ON b.person_id = p.id \
+                 ORDER BY p.id DESC",
+                "SELECT * FROM people AS p LEFT JOIN badges AS b ON b.person_id = p.id \
+                 WHERE p.id = 99 ORDER BY p.id DESC",
+                "TopNExec > ProjectionExec > BatchedIndexNestedLoopLeftJoinExec \
+                 > TableFullScanExec",
+                &["id", "name", "email", "badge_id", "person_id", "label"],
+                &[
+                    Value::Int(2),
+                    text("bob"),
+                    text("bob@example.com"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            ),
+            (
                 "SELECT b.label, p.name FROM people AS p \
                  INNER JOIN badges AS b ON b.person_id = p.id ORDER BY p.name",
                 "SELECT b.label, p.name FROM people AS p \
@@ -2209,6 +2250,13 @@ mod tests {
                 "DistinctExec > ProjectionExec > TablePointGetExec",
                 &["name", "id"],
                 &[text("ada"), Value::Int(1)],
+            ),
+            (
+                "SELECT DISTINCT * FROM people WHERE id = 1",
+                "SELECT DISTINCT * FROM people WHERE id = 99",
+                "DistinctExec > ProjectionExec > TablePointGetExec",
+                &["id", "name", "email"],
+                &[Value::Int(1), text("ada"), text("ada@example.com")],
             ),
             (
                 "SELECT DISTINCT name, id FROM people ORDER BY name",
@@ -2314,26 +2362,44 @@ mod tests {
     }
 
     #[test]
-    fn database_sql_rejects_repeated_output_names_before_reading_rows() {
+    fn database_sql_rejects_repeated_and_reserved_output_names_before_reading_rows() {
         let mut database = select_order_fixture();
-        // A result schema cannot repeat a name, so preparation rejects these
+        // A result schema cannot repeat a name, and blocking projection strips
+        // the internal sort-key prefix from its rows. Preparation rejects both,
         // even when no row matches, and EXPLAIN rejects them too.
-        for (sql, column) in [
-            ("SELECT name AS x, id AS x FROM people WHERE id = 99", "x"),
+        for (sql, message) in [
+            (
+                "SELECT name AS x, id AS x FROM people WHERE id = 99",
+                "duplicate output column x",
+            ),
             (
                 "SELECT * FROM people AS p INNER JOIN people AS q ON q.id = p.id WHERE p.id = 99",
-                "id",
+                "duplicate output column id",
             ),
-            ("SELECT count(*), count(email) FROM people", "count"),
-            ("EXPLAIN SELECT name AS x, id AS x FROM people", "x"),
+            (
+                "SELECT count(*), count(email) FROM people",
+                "duplicate output column count",
+            ),
+            (
+                "EXPLAIN SELECT name AS x, id AS x FROM people",
+                "duplicate output column x",
+            ),
+            (
+                "SELECT coalesce(name, 'x') AS __hawdb_relational_sort_0 FROM people \
+                 ORDER BY __hawdb_relational_sort_0",
+                "output column __hawdb_relational_sort_0 uses the reserved prefix",
+            ),
+            (
+                "SELECT DISTINCT name AS __hawdb_relational_sort_x FROM people",
+                "output column __hawdb_relational_sort_x uses the reserved prefix",
+            ),
+            (
+                "SELECT name AS __hawdb_relational_sort_0 FROM people WHERE id = 99",
+                "output column __hawdb_relational_sort_0 uses the reserved prefix",
+            ),
         ] {
             let error = database.query_sql(sql).expect_err(sql);
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("duplicate output column {column}")),
-                "{sql}: {error}"
-            );
+            assert!(error.to_string().contains(message), "{sql}: {error}");
         }
     }
 

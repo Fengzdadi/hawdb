@@ -103,11 +103,11 @@ mod explain;
 use explain::format_relational_explain;
 
 mod expression;
+pub(crate) use expression::select_output_schema;
 use expression::{
     account_intermediate, aggregate_filter_matches, bind_bound, bind_sql_value, predicate_truth,
     project_bound_row, projection_uses_non_aggregate_scalar_function, reject_non_public_schema,
-    resolve_column, select_output_schema, validate_non_aggregate_coalesce_projections,
-    value_to_relational_as,
+    resolve_column, validate_non_aggregate_coalesce_projections, value_to_relational_as,
 };
 
 mod join;
