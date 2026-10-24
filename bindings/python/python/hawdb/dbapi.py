@@ -25,19 +25,28 @@ the same path with ``hawdb.open``.
 Parameters are a sequence bound to ``$1``, ``$2``, ... in order
 (``paramstyle = "numeric_dollar"``). Statements are sent unchanged: ``?``,
 ``%s`` and ``:name`` are not rewritten and fail like any other invalid SQL.
-Parameter values follow the binding's rules and keep its ``TypeError``,
-``OverflowError`` and ``ValueError``.
+Parameter values follow the binding's rules.
 
 Autocommit is off, as PEP 249 requires. The first ``execute`` or
 ``executemany`` after ``connect``, ``commit()`` or ``rollback()`` begins a
 transaction, even for a query; ``commit()`` publishes it, ``rollback()``
-discards it, and ``close()`` rolls back whatever was not committed.
-``connect(..., autocommit=True)`` instead runs each ``execute`` as its own
-transaction and each ``executemany`` as one atomic batch, and ``commit()``
-and ``rollback()`` do nothing. Statements the engine refuses inside a
-transaction, such as ``CREATE BRANCH`` and ``USE BRANCH``, need such a
-connection. A ``read_only=True`` connection always works this way, because a
-read-only database cannot commit even an empty transaction.
+discards it, and ``close()`` rolls back whatever was not committed. With
+autocommit on, through ``connect(..., autocommit=True)`` or by setting
+``autocommit`` between transactions, each ``execute`` is its own transaction
+and each ``executemany`` one atomic batch, and ``commit()`` and
+``rollback()`` do nothing. Setting ``autocommit`` while a transaction is open,
+or after a failed ``executemany``, raises ``ProgrammingError``. Statements the
+engine refuses inside a transaction, such as ``CREATE BRANCH`` and
+``USE BRANCH``, need autocommit. A ``read_only=True`` connection always
+autocommits, because a read-only database cannot commit even an empty
+transaction, and turning its autocommit off raises ``NotSupportedError``.
+
+A transaction that has only run queries plans them as autocommit does, under
+the same result budgets, but reads through its own workspace. Until it ends,
+it pins the snapshot it began with, which holds back checkpoint reclamation,
+and its statements stay out of the slow-query log and statement summary.
+Neither mode applies query admission to SQL. End read-only transactions
+promptly, or run long-lived read-only work with autocommit on.
 
 A failed ``execute`` leaves the transaction open with the earlier statements
 still staged. A failed ``executemany`` does not: there are no savepoints, so
@@ -62,15 +71,36 @@ positions of the SELECT list. When nothing matches, the same shapes report
 no columns at all: ``description`` is ``None``, and ``pandas.read_sql``
 cannot build a frame from it.
 
-Engine errors keep their ``hawdb.exceptions`` types. ``Error`` and
-``DatabaseError`` are both ``hawdb.exceptions.Error``, so ``DatabaseError``
-also catches ``InterfaceError``. A constraint violation such as a duplicate
-primary key is an ``ExecutionError``: the engine does not single those out,
-so this module's ``IntegrityError`` is declared but not raised. It is not
-``hawdb.exceptions.IntegrityError``, which reports damaged storage rather
-than a violated constraint. Using a closed connection or cursor raises
-``InterfaceError``; fetching before a successful ``execute`` raises
-``ProgrammingError``.
+Errors follow the PEP 249 hierarchy. ``Error`` is ``hawdb.exceptions.Error``;
+``InterfaceError`` and ``DatabaseError`` are its subclasses, and the other
+classes are subclasses of ``DatabaseError``. An engine error is raised as a
+subclass of both its ``hawdb.exceptions`` type and a PEP 249 class, with its
+attributes, so ``except hawdb.exceptions.ParseError`` and
+``except ProgrammingError`` both catch a syntax error:
+
+- ``ProgrammingError``: ``ParseError`` and ``SemanticError``.
+- ``OperationalError``: ``ConflictError``, ``BranchError``, ``AdmissionError``,
+  ``TaskStoppedError``, ``DescriptorError``, ``ResourceBudgetError``,
+  ``BackpressureError``, and an ``ExecutionError`` that is ``retryable``.
+- ``NotSupportedError``: ``CapabilityError``.
+- ``InternalError``: ``hawdb.exceptions.IntegrityError``, which reports
+  damaged storage rather than a violated constraint.
+- ``DatabaseError``: every other engine error, including ``StorageError``
+  and the remaining ``ExecutionError``.
+
+The engine does not set constraint violations apart yet (#1234). A duplicate
+primary key or a NULL in a NOT NULL column is a ``StorageError`` in autocommit
+and an ``ExecutionError`` in a transaction, so both are ``DatabaseError``, and
+this module's ``IntegrityError`` is declared but not raised. A parameter value
+the binding cannot convert is a ``DataError``, such as an integer outside 64
+bits or text that is not valid UTF-8, or a ``ProgrammingError`` for a type it
+does not support. That error is also the binding's ``OverflowError``,
+``UnicodeEncodeError``, ``ValueError`` or ``TypeError``, and a parameter
+container this module refuses is likewise a ``ProgrammingError`` and a
+``TypeError``. A ``RuntimeError`` from the binding, which would mean that the
+connection is out of step with its database, is an ``InternalError``. Using a
+closed connection or cursor raises ``InterfaceError``; fetching before a
+successful ``execute`` raises ``ProgrammingError``.
 
 ``threadsafety`` is 1: threads may share the module but not a connection. A
 connection must stay on the thread that opened it, and other threads get
@@ -90,14 +120,15 @@ takes no temporal parameter values.
 from __future__ import annotations
 
 import datetime
+import functools
 import operator
 import os
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from itertools import islice
 from types import TracebackType
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from hawdb._hawdb import Database, QueryResult, Transaction, exceptions
 from hawdb._hawdb import open as _open
@@ -142,39 +173,211 @@ class Warning(Exception):
 
 
 Error = exceptions.Error
-DatabaseError = Error
 
 
 class InterfaceError(Error):
     """A closed connection or cursor was used."""
 
 
-class ProgrammingError(Error):
-    """A cursor was fetched before a successful execute, or used from another thread."""
+class DatabaseError(Error):
+    """An error from the database; engine errors arrive as its subclasses."""
 
 
-class OperationalError(Error):
-    """A failed ``executemany`` aborted the transaction; call ``rollback()``."""
+class DataError(DatabaseError):
+    """A parameter value the binding cannot convert."""
 
 
-class IntegrityError(Error):
-    """Declared by PEP 249; constraint violations raise ``ExecutionError``."""
+class OperationalError(DatabaseError):
+    """A conflict, busy branch or refused resource, or an aborted connection."""
 
 
-class DataError(Error):
-    """Declared by PEP 249; invalid parameter values keep the binding's types."""
+class IntegrityError(DatabaseError):
+    """Declared by PEP 249; not raised yet, see #1234."""
 
 
-class InternalError(Error):
-    """Declared by PEP 249; HawDB does not raise it."""
+class InternalError(DatabaseError):
+    """Damaged storage, or a connection out of step with its database."""
 
 
-class NotSupportedError(Error):
-    """Declared by PEP 249; HawDB does not raise it."""
+class ProgrammingError(DatabaseError):
+    """An invalid statement or parameter, or a misused connection or cursor."""
+
+
+class NotSupportedError(DatabaseError):
+    """An unavailable capability, or autocommit off on a read-only connection."""
+
+
+# An error from the binding is raised as a subclass of both its own type and
+# its PEP 249 class, so code written against either keeps working. They are
+# defined here, under the names they are bound to, so that they pickle.
+class _ParseError(exceptions.ParseError, ProgrammingError):
+    pass
+
+
+class _SemanticError(exceptions.SemanticError, ProgrammingError):
+    pass
+
+
+class _StorageError(exceptions.StorageError, DatabaseError):
+    pass
+
+
+class _StorageIntegrityError(exceptions.IntegrityError, InternalError):
+    pass
+
+
+class _DescriptorError(exceptions.DescriptorError, OperationalError):
+    pass
+
+
+class _ExecutionError(exceptions.ExecutionError, DatabaseError):
+    pass
+
+
+class _RetryableExecutionError(exceptions.ExecutionError, OperationalError):
+    pass
+
+
+class _ResourceBudgetError(exceptions.ResourceBudgetError, OperationalError):
+    pass
+
+
+class _ConflictError(exceptions.ConflictError, OperationalError):
+    pass
+
+
+class _CapabilityError(exceptions.CapabilityError, NotSupportedError):
+    pass
+
+
+class _BranchError(exceptions.BranchError, OperationalError):
+    pass
+
+
+class _AdmissionError(exceptions.AdmissionError, OperationalError):
+    pass
+
+
+class _TaskStoppedError(exceptions.TaskStoppedError, OperationalError):
+    pass
+
+
+class _RetainedError(exceptions.RetainedError, DatabaseError):
+    pass
+
+
+class _BackpressureError(exceptions.BackpressureError, OperationalError):
+    pass
+
+
+class _InternalRuntimeError(RuntimeError, InternalError):
+    pass
+
+
+class _ProgrammingTypeError(TypeError, ProgrammingError):
+    pass
+
+
+class _DataValueError(ValueError, DataError):
+    pass
+
+
+class _DataOverflowError(OverflowError, DataError):
+    pass
+
+
+class _DataEncodingError(UnicodeEncodeError, DataError):
+    pass
+
+
+# Keyed by exact type, so that a subclass such as RecursionError passes through.
+_ENGINE_ERRORS: dict[type[Exception], type[Exception]] = {
+    # DatabaseError already derives from hawdb.exceptions.Error.
+    exceptions.Error: DatabaseError,
+    exceptions.ParseError: _ParseError,
+    exceptions.SemanticError: _SemanticError,
+    exceptions.StorageError: _StorageError,
+    exceptions.IntegrityError: _StorageIntegrityError,
+    exceptions.DescriptorError: _DescriptorError,
+    exceptions.ExecutionError: _ExecutionError,
+    exceptions.ResourceBudgetError: _ResourceBudgetError,
+    exceptions.ConflictError: _ConflictError,
+    exceptions.CapabilityError: _CapabilityError,
+    exceptions.BranchError: _BranchError,
+    exceptions.AdmissionError: _AdmissionError,
+    exceptions.TaskStoppedError: _TaskStoppedError,
+    exceptions.RetainedError: _RetainedError,
+    exceptions.BackpressureError: _BackpressureError,
+    RuntimeError: _InternalRuntimeError,
+}
+# Only statements convert parameters, so only there do these mean a bad value.
+_PARAMETER_ERRORS: dict[type[Exception], type[Exception]] = {
+    TypeError: _ProgrammingTypeError,
+    ValueError: _DataValueError,
+    OverflowError: _DataOverflowError,
+    UnicodeEncodeError: _DataEncodingError,
+}
+
+
+def _pep249(error: Exception, statement: bool) -> Exception:
+    """Returns ``error`` as its PEP 249 subclass, or unchanged without one."""
+    target = _ENGINE_ERRORS.get(type(error))
+    if target is None and statement:
+        target = _PARAMETER_ERRORS.get(type(error))
+    if target is None:
+        return error
+    if target is _ExecutionError and getattr(error, "retryable", False) is True:
+        target = _RetryableExecutionError
+    translated = target(*error.args)
+    vars(translated).update(vars(error))
+    return translated
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _raises_pep249(
+    statement: bool = False,
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Raises the binding's errors from the decorated method as PEP 249 errors.
+
+    ``statement`` marks a method that converts statement parameters.
+    """
+
+    def decorate(method: Callable[_P, _R]) -> Callable[_P, _R]:
+        @functools.wraps(method)
+        def call(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                return method(*args, **kwargs)
+            except Exception as error:
+                translated = _pep249(error, statement)
+                try:
+                    if translated is error:
+                        raise
+                    # The binding's error stays reachable as __context__.
+                    translated.__traceback__ = error.__traceback__
+                    raise translated from error.__cause__
+                finally:
+                    # The traceback holds this frame, so a local naming the
+                    # error would form a cycle that only the garbage collector
+                    # frees, possibly on another thread, where the unsendable
+                    # native objects in the traceback cannot be dropped.
+                    del translated
+
+        return call
+
+    return decorate
 
 
 class _TypeObject:
-    """A PEP 249 type object, equal to each Python type it groups."""
+    """A PEP 249 type object, equal to each Python type it groups.
+
+    It hashes by identity, so it can key a dict, but a set of type objects
+    finds only the objects themselves: compare a type code with ``==``.
+    """
+
+    __hash__ = object.__hash__
 
     def __init__(self, name: str, *types: type) -> None:
         self._name = name
@@ -223,6 +426,7 @@ class Connection:
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
 
+    @_raises_pep249()
     def __init__(
         self,
         path: str | os.PathLike[str] | None = None,
@@ -239,6 +443,7 @@ class Connection:
             max_read_result_payload_bytes=max_read_result_payload_bytes,
         )
         # A read-only database cannot commit even an empty transaction.
+        self._read_only = bool(read_only)
         self._autocommit = bool(autocommit or read_only)
         # Thread-local, so a later thread that reuses this thread's ident
         # does not pass for the owner.
@@ -249,13 +454,30 @@ class Connection:
 
     @property
     def autocommit(self) -> bool:
-        """Whether each statement commits on its own; fixed when connecting."""
+        """Whether each statement commits on its own.
+
+        It changes only between transactions, and a read-only connection
+        keeps it on.
+        """
         return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._open()
+        if self._transaction is not None or self._aborted:
+            raise ProgrammingError(
+                "autocommit changes only between transactions; "
+                "call commit() or rollback() first"
+            )
+        if self._read_only and not value:
+            raise NotSupportedError("a read-only connection always autocommits")
+        self._autocommit = bool(value)
 
     def cursor(self) -> Cursor:
         self._open()
         return Cursor(self)
 
+    @_raises_pep249()
     def commit(self) -> None:
         """Publish the open transaction; without one, do nothing."""
         self._usable()
@@ -263,6 +485,7 @@ class Connection:
         if transaction is not None:
             transaction.commit()
 
+    @_raises_pep249()
     def rollback(self) -> None:
         """Discard the open transaction and clear an aborted state."""
         self._open()
@@ -271,6 +494,7 @@ class Connection:
         if transaction is not None:
             transaction.rollback()
 
+    @_raises_pep249()
     def close(self) -> None:
         """Roll back uncommitted work and close the database; repeats do nothing."""
         if self._database is None:
@@ -321,11 +545,13 @@ class Connection:
             self._transaction = database.transaction()
         return self._transaction
 
+    @_raises_pep249(statement=True)
     def _execute(self, operation: str, parameters: list[Any] | None) -> QueryResult:
         if self._autocommit:
             return self._open().execute_sql(operation, parameters)
         return self._begin().execute_sql(operation, parameters)
 
+    @_raises_pep249(statement=True)
     def _executemany(
         self, operation: str, seq_of_parameters: Sequence[Sequence[Any]]
     ) -> None:
@@ -403,7 +629,9 @@ class Cursor:
         self._reset()
         # Wrong arguments must fail here: a failed batch aborts the transaction.
         if not isinstance(operation, str):
-            raise TypeError(f"operation must be a str, not {type(operation).__name__}")
+            raise _ProgrammingTypeError(
+                f"operation must be a str, not {type(operation).__name__}"
+            )
         _sequence(seq_of_parameters, "seq_of_parameters")
         self.connection._executemany(operation, seq_of_parameters)
         self._rows = iter(())
@@ -472,7 +700,7 @@ def _sequence(value: Any, name: str) -> Sequence[Any]:
     # The binding's rule for parameter containers, checked here so that a
     # wrong container fails before it reaches the connection's transaction.
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
-        raise TypeError(
+        raise _ProgrammingTypeError(
             f"{name} must be a sequence such as a list or tuple, not "
             f"{type(value).__name__}; statements bind $1, $2, ... by position"
         )

@@ -379,11 +379,18 @@ with hawdb.connect() as connection:
 Parameters bind by position to `$1`, `$2`, ... (`paramstyle` is
 `"numeric_dollar"`). Autocommit is off: statements, queries included, run in a
 transaction that `commit()` publishes and that `rollback()`, `close()` or an
-exception leaving the `with` block discards. A failed `executemany` rolls back
+exception leaving the `with` block discards. A transaction that only reads
+still pins its snapshot until it ends, so end it promptly, or turn autocommit on
+for long-lived reading. A failed `executemany` rolls back
 the whole transaction, and the connection refuses further work until
-`rollback()`. Branch commands need `connect(..., autocommit=True)`, and
-read-only connections always autocommit. Use and close a connection on the
-thread that opened it.
+`rollback()`. Branch commands need autocommit, which
+`connect(..., autocommit=True)` turns on and `connection.autocommit` changes
+between transactions; read-only connections always autocommit. Errors follow
+the PEP 249 hierarchy, and engine errors keep their `hawdb.exceptions` types
+as well: a syntax error is both a `ProgrammingError` and a
+`hawdb.exceptions.ParseError`. Constraint violations such as a duplicate
+primary key are plain `DatabaseError`s, because the engine does not set them
+apart yet. Use and close a connection on the thread that opened it.
 
 Rows are tuples. Until an engine fix, some query shapes, such as key lookups,
 `ORDER BY`, aggregates and `GROUP BY`, return their columns sorted by name, and

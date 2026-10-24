@@ -19,7 +19,9 @@ transaction semantics also run on a file database, and durability, read-only
 and branch cases use one directly.
 """
 
+import gc
 import inspect
+import pickle
 import threading
 from collections import deque
 
@@ -30,6 +32,37 @@ from hawdb import dbapi
 
 CREATE = "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)"
 INSERT = "INSERT INTO items (id, name) VALUES ($1, $2)"
+
+PEP249_ERRORS = [
+    dbapi.InterfaceError, dbapi.DatabaseError, dbapi.DataError,
+    dbapi.OperationalError, dbapi.IntegrityError, dbapi.InternalError,
+    dbapi.ProgrammingError, dbapi.NotSupportedError,
+]
+
+# The PEP 249 class each error from the binding gains.
+PEP249_CLASS = {
+    hawdb.exceptions.Error: dbapi.DatabaseError,
+    hawdb.exceptions.ParseError: dbapi.ProgrammingError,
+    hawdb.exceptions.SemanticError: dbapi.ProgrammingError,
+    hawdb.exceptions.StorageError: dbapi.DatabaseError,
+    hawdb.exceptions.IntegrityError: dbapi.InternalError,
+    hawdb.exceptions.DescriptorError: dbapi.OperationalError,
+    hawdb.exceptions.ExecutionError: dbapi.DatabaseError,
+    hawdb.exceptions.ResourceBudgetError: dbapi.OperationalError,
+    hawdb.exceptions.ConflictError: dbapi.OperationalError,
+    hawdb.exceptions.CapabilityError: dbapi.NotSupportedError,
+    hawdb.exceptions.BranchError: dbapi.OperationalError,
+    hawdb.exceptions.AdmissionError: dbapi.OperationalError,
+    hawdb.exceptions.TaskStoppedError: dbapi.OperationalError,
+    hawdb.exceptions.RetainedError: dbapi.DatabaseError,
+    hawdb.exceptions.BackpressureError: dbapi.OperationalError,
+    RuntimeError: dbapi.InternalError,
+}
+
+
+def pep249_classes(error):
+    """The PEP 249 classes ``error`` is an instance of, in a fixed order."""
+    return [pep for pep in PEP249_ERRORS if isinstance(error, pep)]
 
 
 @pytest.fixture(params=["file", "memory"])
@@ -74,7 +107,11 @@ def test_module_interface():
         "2.0", 1, "numeric_dollar",
     )
     assert hawdb.connect is dbapi.connect is dbapi.Connection
-    assert dbapi.Error is dbapi.DatabaseError is hawdb.exceptions.Error
+    assert dbapi.Error is hawdb.exceptions.Error
+    # InterfaceError and DatabaseError are siblings; the rest are database errors.
+    assert not issubclass(dbapi.InterfaceError, dbapi.DatabaseError)
+    for pep in PEP249_ERRORS[2:]:
+        assert issubclass(pep, dbapi.DatabaseError)
     assert issubclass(dbapi.Warning, Exception)
     assert not issubclass(dbapi.Warning, dbapi.Error)
     names = [
@@ -164,6 +201,13 @@ def test_description_type_codes_come_from_python_values(connection):
     assert dbapi.Binary(bytearray(b"x")) == b"x"
 
 
+def test_type_objects_hash_by_identity():
+    assert {dbapi.NUMBER: "number", dbapi.STRING: "string"}[dbapi.NUMBER] == "number"
+    assert hash(dbapi.ROWID) == hash(dbapi.ROWID)
+    # A set holds the type objects themselves, so compare a type code with ==.
+    assert int == dbapi.NUMBER and int not in {dbapi.NUMBER}
+
+
 def test_statements_without_result_columns(connection):
     cursor = connection.cursor()
     for statement, parameters in [(CREATE, None), (INSERT, [1, "one"])]:
@@ -219,8 +263,9 @@ def test_fetch_without_a_result_raises_programming_error(connection):
 @pytest.mark.parametrize("parameters", ["12", b"12", bytearray(b"12"), {"1": 1}, 7])
 def test_parameters_must_be_a_positional_sequence(connection, parameters):
     cursor = connection.cursor()
-    with pytest.raises(TypeError, match="by position"):
+    with pytest.raises(TypeError, match="by position") as caught:
         cursor.execute(CREATE, parameters)
+    assert isinstance(caught.value, dbapi.ProgrammingError)
 
 
 @pytest.mark.parametrize(
@@ -247,10 +292,147 @@ def test_other_placeholders_are_not_rewritten(connection, placeholder):
         cursor.execute(f"SELECT id FROM items WHERE id = {placeholder}", [1])
 
 
-def test_engine_errors_keep_their_types(connection):
-    with pytest.raises(hawdb.exceptions.ParseError) as caught:
-        connection.cursor().execute("SELEC 1")
-    assert isinstance(caught.value, connection.DatabaseError)
+@pytest.mark.parametrize(
+    "statement,parameters,native,pep",
+    [
+        ("SELEC 1", None, hawdb.exceptions.ParseError, dbapi.ProgrammingError),
+        ("SELECT id FROM missing", None, hawdb.exceptions.SemanticError,
+         dbapi.ProgrammingError),
+        ("SELECT $1, $2", [1], hawdb.exceptions.SemanticError, dbapi.ProgrammingError),
+        ("SELECT $1", [object()], TypeError, dbapi.ProgrammingError),
+        ("SELECT $1", [2**70], OverflowError, dbapi.DataError),
+        ("SELECT $1", ["\ud800"], UnicodeEncodeError, dbapi.DataError),
+    ],
+    ids=["syntax", "unknown table", "missing parameter", "unsupported type",
+         "integer overflow", "invalid text"],
+)
+def test_errors_keep_their_types_and_gain_pep249_classes(
+    connection, statement, parameters, native, pep
+):
+    with pytest.raises(native) as caught:
+        connection.cursor().execute(statement, parameters)
+    assert pep249_classes(caught.value) == [connection.DatabaseError, pep]
+
+
+def test_constraint_violations_are_plain_database_errors(connection):
+    cursor = connection.cursor()
+    cursor.execute(CREATE)
+    cursor.execute(INSERT, [1, "one"])
+    connection.commit()
+    connection.autocommit = True
+    with pytest.raises(hawdb.exceptions.StorageError, match="duplicate") as autocommitted:
+        cursor.execute(INSERT, [1, "again"])
+    connection.autocommit = False
+    with pytest.raises(hawdb.exceptions.ExecutionError, match="duplicate") as staged:
+        cursor.execute(INSERT, [1, "again"])
+    # Not IntegrityError, which the engine cannot tell apart yet, nor an
+    # OperationalError that a retry loop would repeat.
+    for caught in (autocommitted, staged):
+        assert pep249_classes(caught.value) == [dbapi.DatabaseError]
+
+
+def test_a_busy_path_is_an_operational_error(tmp_path):
+    path = tmp_path / "db"
+    with hawdb.connect(path) as holder:
+        holder.cursor().execute(CREATE)
+        with hawdb.connect(path, autocommit=True) as other:
+            with pytest.raises(hawdb.exceptions.BranchError, match="busy") as caught:
+                other.cursor().execute("SELECT id FROM items")
+    assert pep249_classes(caught.value) == [dbapi.DatabaseError, dbapi.OperationalError]
+
+
+def test_translated_errors_keep_attributes_and_pickle():
+    with hawdb.connect(max_read_result_rows=1) as connection:
+        cursor = connection.cursor()
+        cursor.execute(CREATE)
+        cursor.executemany(INSERT, [(1, "a"), (2, "b")])
+        with pytest.raises(hawdb.exceptions.ExecutionError) as caught:
+            cursor.execute("SELECT id FROM items")
+    error = caught.value
+    assert (error.kind, error.retryable) == ("execution", False)
+    assert pep249_classes(error) == [dbapi.DatabaseError]
+    # The binding's own error stays reachable for debugging.
+    assert type(error.__context__) is hawdb.exceptions.ExecutionError
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is type(error)
+    assert (restored.args, restored.kind) == (error.args, "execution")
+
+
+@pytest.mark.parametrize("native", list(PEP249_CLASS), ids=lambda native: native.__name__)
+def test_every_binding_error_maps_to_its_pep249_class(native):
+    error = native("message")
+    error.detail = "kept"
+    translated = dbapi._pep249(error, statement=False)
+    assert isinstance(translated, native)
+    expected = PEP249_CLASS[native]
+    assert pep249_classes(translated) == [
+        pep for pep in PEP249_ERRORS if issubclass(expected, pep)
+    ]
+    assert (translated.args, translated.detail) == (("message",), "kept")
+
+
+def test_the_mapping_covers_every_engine_error():
+    engine = {
+        value for value in vars(hawdb.exceptions).values()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    }
+    assert engine == set(PEP249_CLASS) - {RuntimeError}
+
+
+def test_a_retryable_execution_error_is_operational():
+    error = hawdb.exceptions.ExecutionError("projection is busy")
+    error.kind, error.retryable = "projection_busy", True
+    translated = dbapi._pep249(error, statement=False)
+    assert pep249_classes(translated) == [dbapi.DatabaseError, dbapi.OperationalError]
+    assert translated.retryable
+
+
+def test_built_in_errors_gain_classes_only_from_statements():
+    for error, pep in [
+        (TypeError("type"), dbapi.ProgrammingError),
+        (ValueError("value"), dbapi.DataError),
+        (OverflowError("range"), dbapi.DataError),
+    ]:
+        assert dbapi._pep249(error, statement=False) is error
+        translated = dbapi._pep249(error, statement=True)
+        assert isinstance(translated, type(error)) and isinstance(translated, pep)
+    # Only exact types map, so a subclass such as RecursionError passes through.
+    recursion = RecursionError("deep")
+    assert dbapi._pep249(recursion, statement=True) is recursion
+    with pytest.raises(ValueError, match="requires a database path") as caught:
+        hawdb.connect(None, True)
+    assert not isinstance(caught.value, dbapi.Error)
+
+
+def test_errors_leave_no_reference_cycle():
+    # A cycle through a traceback would leave the unsendable native objects in
+    # it to the garbage collector, which may run on another thread.
+    connection = hawdb.connect()
+    cursor = connection.cursor()
+    cursor.execute(CREATE)
+    closed = hawdb.connect()
+    closed.close()
+
+    def fail():
+        for call in [
+            lambda: cursor.execute("SELEC 1"),
+            lambda: cursor.executemany(INSERT, [(1, object())]),
+            closed.commit,  # an error the connection raises unchanged
+        ]:
+            try:
+                call()
+            except dbapi.Error:
+                pass
+
+    gc.collect()
+    gc.disable()
+    try:
+        fail()
+        unreachable = gc.collect()
+    finally:
+        gc.enable()
+        connection.close()
+    assert unreachable == 0
 
 
 def test_commit_publishes_and_rollback_discards(connect):
@@ -296,14 +478,16 @@ def test_failed_executemany_aborts_until_rollback(connect):
         connection.commit,
     ]
     # Engine, value and row-shape failures inside the batch.
-    for rows, error in [
-        ([(2, "b"), (2, "duplicate")], hawdb.exceptions.ExecutionError),
-        ([(2, "b"), (3, object())], TypeError),
-        ([(2, "b"), "not a row"], TypeError),
+    for rows, error, pep in [
+        ([(2, "b"), (2, "duplicate")], hawdb.exceptions.ExecutionError,
+         dbapi.DatabaseError),
+        ([(2, "b"), (3, object())], TypeError, dbapi.ProgrammingError),
+        ([(2, "b"), "not a row"], TypeError, dbapi.ProgrammingError),
     ]:
         cursor.execute(INSERT, [1, "before the batch"])
-        with pytest.raises(error):
+        with pytest.raises(error) as caught:
             cursor.executemany(INSERT, rows)
+        assert isinstance(caught.value, pep)
         for call in refused:
             with pytest.raises(dbapi.OperationalError, match="rollback"):
                 call()
@@ -377,6 +561,29 @@ def test_autocommit_runs_each_statement_on_its_own():
         assert ids(connection) == [1, 2, 3]
 
 
+def test_autocommit_changes_between_transactions(connection):
+    cursor = connection.cursor()
+    cursor.execute(CREATE)
+    with pytest.raises(dbapi.ProgrammingError, match="between transactions"):
+        connection.autocommit = True
+    connection.commit()
+    connection.autocommit = True
+    cursor.execute(INSERT, [1, "one"])
+    connection.rollback()  # nothing is open in autocommit
+    connection.autocommit = False
+    cursor.execute(INSERT, [2, "two"])
+    connection.rollback()
+    assert ids(connection) == [1]
+    with pytest.raises(TypeError):
+        cursor.executemany(INSERT, [(3, object())])
+    # An aborted connection is still in its transaction until rollback().
+    with pytest.raises(dbapi.ProgrammingError, match="between transactions"):
+        connection.autocommit = True
+    connection.rollback()
+    connection.autocommit = True
+    assert connection.autocommit
+
+
 def test_executemany_stages_in_the_connection_transaction(connection):
     cursor = connection.cursor()
     cursor.execute(CREATE)
@@ -406,8 +613,9 @@ def test_wrong_batch_arguments_leave_the_transaction_open(connection, operation,
     cursor = connection.cursor()
     cursor.execute(CREATE)
     cursor.execute(INSERT, [1, "staged"])
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as caught:
         cursor.executemany(operation, rows)
+    assert isinstance(caught.value, dbapi.ProgrammingError)
     connection.commit()
     assert ids(connection) == [1]
 
@@ -429,6 +637,9 @@ def test_read_only_connection_runs_in_autocommit(tmp_path):
         connection.cursor().execute(INSERT, [1, "one"])
     with hawdb.connect(path, True) as connection:
         assert connection.autocommit
+        connection.autocommit = True
+        with pytest.raises(dbapi.NotSupportedError, match="read-only"):
+            connection.autocommit = False
         assert ids(connection) == [1]
         connection.commit()
         with pytest.raises(hawdb.exceptions.ExecutionError, match="read-only"):
@@ -457,6 +668,7 @@ def test_closed_connection_and_cursor_raise_interface_error(connection):
     connection.close()
     calls = [
         connection.cursor, connection.commit, connection.rollback,
+        lambda: setattr(connection, "autocommit", True),
         lambda: other.execute(CREATE), lambda: other.executemany(INSERT, []),
         other.fetchall,
     ]
@@ -470,6 +682,7 @@ def test_connection_stays_on_its_thread(connection):
     calls = [
         connection.cursor, connection.commit, connection.rollback,
         connection.close, lambda: cursor.execute(CREATE),
+        lambda: setattr(connection, "autocommit", True),
     ]
     errors = []
 
