@@ -261,6 +261,12 @@ construction. They cover a pending `PanicException` and a panicking release call
 may cross the C destructor; descriptors are still released and ordinary pending
 Python exceptions restored.
 
+Python `open` path checks (`bindings/python/tests/test_file.py` and
+`test_memory.py`) run in `//bindings/python:hawdb_python_tests` and the Python
+Bindings `pytest` step. A bare relative name opens or creates the project in
+the current directory, `":memory:"` is refused, and a missing parent is refused
+before any directory is created. No lane, feature or profile change.
+
 The `registered_consumer_embedded` cases in
 `tests/support/embedded_consumer_coverage.rs` belong to `mvcc_staging_session`
 and its existing `registered_consumer` native-platform selection. Both default

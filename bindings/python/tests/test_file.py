@@ -38,6 +38,30 @@ def test_open_rejects_missing_parent(tmp_path):
         hawdb.open(tmp_path / "missing" / "deep" / "db")
 
 
+def test_open_accepts_bare_relative_path(tmp_path, monkeypatch):
+    # Like sqlite3.connect("app.db"), a bare name opens or creates the
+    # database in the current directory.
+    monkeypatch.chdir(tmp_path)
+    with hawdb.open("app.db") as db:
+        assert db.path == "app.db"
+        db.execute("CREATE (:Persisted {id: 1})")
+
+    assert (tmp_path / "app.db").is_dir()
+    with hawdb.open("app.db") as reopened:
+        assert reopened.execute("MATCH (p:Persisted) RETURN p.id AS id").fetchall() == [
+            {"id": 1}
+        ]
+
+
+def test_open_rejects_missing_relative_parent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(
+        exceptions.Error, match=r"^parent directory does not exist: missing$"
+    ):
+        hawdb.open("missing/app.db")
+    assert not (tmp_path / "missing").exists()
+
+
 def test_open_rejects_read_only_without_existing_path(tmp_path):
     with pytest.raises(Exception):
         hawdb.open(tmp_path / "absent", read_only=True)

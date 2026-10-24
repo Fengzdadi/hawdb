@@ -61,6 +61,14 @@ def test_memory_open_rejects_read_only():
         hawdb.Database(read_only=True)
 
 
+def test_memory_sentinel_path_is_refused(tmp_path, monkeypatch):
+    # sqlite3 spells an in-memory database ":memory:"; HawDB takes no path.
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="pass no path for an in-memory database"):
+        hawdb.open(":memory:")
+    assert not (tmp_path / ":memory:").exists()
+
+
 def test_database_constructor_without_path_opens_memory():
     db = hawdb.Database()
     try:

@@ -317,7 +317,8 @@ the transaction context normally.
 notebooks, and other hosts that already hold their data. It answers the same
 `execute` / `execute_sql` calls through the same embedded admission path;
 `close()` discards everything and a later `open()` does not see it.
-`db.path` is `None` for in-memory handles.
+`db.path` is `None` for in-memory handles. Unlike `sqlite3`, `":memory:"` is
+not an in-memory path: `hawdb.open(":memory:")` raises `ValueError`.
 
 ```python
 db = hawdb.open()

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hawdb::{
     DatabaseConfig, DatabaseReadTransaction, DurabilityPolicy, EmbeddedDeploymentProfile,
@@ -852,7 +852,8 @@ impl ReadTransaction {
 /// Opens a HawDB database, creating a durable project at `path` if needed.
 ///
 /// Called without `path` it returns an empty in-memory database: no project
-/// directory is created and closing the handle discards all data.
+/// directory is created and closing the handle discards all data. Unlike
+/// sqlite3, `":memory:"` is not an in-memory path and raises ValueError.
 /// `read_only=True` requires a path and opens an existing database read-only.
 /// Optional read budgets pass through to the engine; None keeps its defaults.
 #[pyfunction]
@@ -863,14 +864,24 @@ pub fn open(
     max_read_result_rows: Option<usize>,
     max_read_result_payload_bytes: Option<usize>,
 ) -> PyResult<Database> {
+    // Here ":memory:" would name a durable project directory, which is not
+    // what a caller used to sqlite3 or DuckDB expects.
+    if path.as_deref() == Some(Path::new(":memory:")) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "\":memory:\" is not supported; pass no path for an in-memory database",
+        ));
+    }
     if let Some(path) = &path
         && !read_only
         && !path.exists()
     {
         // HawDB creates the database on open; surface a hint only when the
         // parent directory is missing so a typo fails loudly instead of
-        // creating a stray directory tree.
+        // creating a stray directory tree. A bare file name such as
+        // "app.db" has an empty parent: the name resolves against the
+        // current directory, so there is no parent to check.
         if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
             && !parent.exists()
         {
             return Err(Error::new_err(format!(
