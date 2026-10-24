@@ -101,6 +101,10 @@ fn hash_row<'a>(
     len: usize,
     fields: impl Iterator<Item = (&'a str, &'a Value)>,
 ) {
+    // Hash fields in name order, as maps iterate, so a result digests the same
+    // whether it arrives as ordered `QueryRows` or as name-keyed rows.
+    let mut fields = fields.collect::<Vec<_>>();
+    fields.sort_unstable_by_key(|(name, _)| *name);
     hasher.update((len as u64).to_le_bytes());
     for (name, value) in fields {
         hash_bytes(hasher, name.as_bytes());
@@ -165,7 +169,31 @@ pub(crate) fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hawdb::Uuid;
+    use hawdb::{QuerySchema, Uuid};
+
+    #[test]
+    fn row_digests_do_not_depend_on_result_column_order() {
+        let row = Row::from([
+            ("id".to_string(), Value::Int(1)),
+            ("name".to_string(), Value::String("ada".to_string())),
+        ]);
+        let ordered = |columns: [&str; 2]| {
+            QueryRows::try_from_named_rows(
+                QuerySchema::try_new(columns.map(str::to_string)).unwrap(),
+                vec![row.clone()],
+            )
+            .unwrap()
+        };
+        let expected = rows_sha256(std::slice::from_ref(&row));
+
+        for rows in [ordered(["name", "id"]), ordered(["id", "name"])] {
+            assert_eq!(rows_sha256(&rows), expected);
+            assert_eq!(rows_sha256(&rows.into_iter().collect::<Vec<_>>()), expected);
+        }
+        let mut changed = row.clone();
+        changed.insert("id".to_string(), Value::Int(2));
+        assert_ne!(rows_sha256(&[changed]), expected);
+    }
 
     #[test]
     fn uuid_values_have_a_distinct_canonical_digest() {

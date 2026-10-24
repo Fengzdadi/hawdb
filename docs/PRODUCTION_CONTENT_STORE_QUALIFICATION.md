@@ -16,7 +16,8 @@ create replicas, or derive an oracle from HawDB itself.
 - The database has a clean authoritative checkpoint and the expected canonical
   commit epoch.
 - Expected row counts and SHA-256 result digests come from an offline reference
-  snapshot owned by the Mem adapter.
+  snapshot owned by the Mem adapter. A result digest hashes each row's named
+  fields in name order, so it does not depend on the result's column order.
 - The identity records the exact revision, target, features, configuration,
   dataset, and schema being qualified.
 
