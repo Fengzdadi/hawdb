@@ -217,10 +217,6 @@ def test_statements_without_result_columns(connection):
         assert cursor.fetchall() == []
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    reason="the engine reports no columns when a key lookup matches no rows (#1225)",
-)
 def test_empty_key_lookup_still_describes_its_columns(connection):
     cursor = connection.cursor()
     cursor.execute(CREATE)
@@ -230,10 +226,6 @@ def test_empty_key_lookup_still_describes_its_columns(connection):
     assert [column[0] for column in cursor.description] == ["id", "name"]
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    reason="the engine sorts the columns of a key lookup by name (#1225)",
-)
 def test_rows_follow_the_select_list(connection):
     cursor = connection.cursor()
     cursor.execute(CREATE)

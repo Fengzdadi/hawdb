@@ -55,21 +55,20 @@ before it. The connection is then aborted: ``execute``, ``executemany`` and
 ``commit()`` raise ``OperationalError`` until ``rollback()`` acknowledges the
 lost work. ``close()`` still succeeds.
 
-Rows are tuples in ``description`` order. ``description`` holds one
-seven-item tuple per column: the name, a type code and five ``None``. The
-type code is the Python type of the column's first non-null value, or
-``None`` when every value is null. ``STRING`` equals ``str``, ``BINARY``
-equals ``bytes`` and ``NUMBER`` equals ``int`` and ``float``; booleans and
-vectors match none of them. DDL and every INSERT, UPDATE and DELETE leave
-``description`` as ``None`` and ``rowcount`` as -1, since the binding does
-not report affected rows, and fetching from them returns no rows.
+Rows are tuples in ``description`` order, which is the order of the SELECT
+list. ``description`` holds one seven-item tuple per column, also when no
+row matches: the name, a type code and five ``None``. The type code is the
+Python type of the column's first non-null value, or ``None`` when there is
+none. ``STRING`` equals ``str``, ``BINARY`` equals ``bytes`` and ``NUMBER``
+equals ``int`` and ``float``; booleans and vectors match none of them. DDL
+and every INSERT, UPDATE and DELETE leave ``description`` as ``None`` and
+``rowcount`` as -1, since the binding does not report affected rows, and
+fetching from them returns no rows.
 
-Two engine gaps show through. Key lookups, joins, ORDER BY, DISTINCT,
-aggregates and GROUP BY return their columns sorted by name rather than in
-SELECT order, so read a row by the names in ``description``, not by the
-positions of the SELECT list. When nothing matches, the same shapes report
-no columns at all: ``description`` is ``None``, and ``pandas.read_sql``
-cannot build a frame from it.
+Queries on the system catalogs (``information_schema``, ``pg_catalog`` and
+``system``) are the exception: the engine still returns their columns sorted
+by name, and none at all when nothing matches, so read their rows by the
+names in ``description``.
 
 Errors follow the PEP 249 hierarchy. ``Error`` is ``hawdb.exceptions.Error``;
 ``InterfaceError`` and ``DatabaseError`` are its subclasses, and the other

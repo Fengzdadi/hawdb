@@ -393,12 +393,13 @@ as well: a syntax error is both a `ProgrammingError` and a
 primary key are plain `DatabaseError`s, because the engine does not set them
 apart yet. Use and close a connection on the thread that opened it.
 
-Rows are tuples. Until an engine fix, some query shapes, such as key lookups,
-`ORDER BY`, aggregates and `GROUP BY`, return their columns sorted by name, and
-report no columns at all when nothing matches. Read rows by the names in
-`description` rather than by SELECT-list position. `pandas.read_sql` works,
-with a warning that pandas only tests SQLAlchemy and sqlite3 connections, but
-it fails on such an empty result. `help(hawdb.dbapi)` gives the full contract.
+Rows are tuples in SELECT-list order, and `description` lists the columns even
+when nothing matches, except in queries on the system catalogs
+(`information_schema`, `pg_catalog` and `system`): those still return their
+columns sorted by name, and none when nothing matches, so read their rows by
+the names in `description`. `pandas.read_sql` works, with a warning that pandas
+only tests SQLAlchemy and sqlite3 connections. `help(hawdb.dbapi)` gives the
+full contract.
 
 ## Pydantic rows (optional)
 
