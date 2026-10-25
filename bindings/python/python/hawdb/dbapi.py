@@ -65,10 +65,11 @@ and every INSERT, UPDATE and DELETE leave ``description`` as ``None`` and
 ``rowcount`` as -1, since the binding does not report affected rows, and
 fetching from them returns no rows.
 
-Queries on the system catalogs (``information_schema``, ``pg_catalog`` and
-``system``) are the exception: the engine still returns their columns sorted
-by name, and none at all when nothing matches, so read their rows by the
-names in ``description``.
+``EXPLAIN`` and queries on the system catalogs (``information_schema``,
+``pg_catalog`` and ``system``) are the exception: the engine still returns
+their columns sorted by name, and a catalog query that matches nothing
+reports none at all (#1249). Read their rows by the names in
+``description``.
 
 Errors follow the PEP 249 hierarchy. ``Error`` is ``hawdb.exceptions.Error``;
 ``InterfaceError`` and ``DatabaseError`` are its subclasses, and the other
