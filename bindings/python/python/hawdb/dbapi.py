@@ -320,7 +320,7 @@ _PARAMETER_ERRORS: dict[type[Exception], type[Exception]] = {
 
 
 def _pep249(error: Exception, statement: bool) -> Exception:
-    """Returns ``error`` as its PEP 249 subclass, or unchanged without one."""
+    """Returns ``error`` rebuilt as its PEP 249 subclass, or else unchanged."""
     target = _ENGINE_ERRORS.get(type(error))
     if target is None and statement:
         target = _PARAMETER_ERRORS.get(type(error))
@@ -328,8 +328,13 @@ def _pep249(error: Exception, statement: bool) -> Exception:
         return error
     if target is _ExecutionError and getattr(error, "retryable", False) is True:
         target = _RetryableExecutionError
-    translated = target(*error.args)
-    vars(translated).update(vars(error))
+    try:
+        translated = target(*error.args)
+        vars(translated).update(vars(error))
+    except Exception:
+        # A failure here, such as a constructor that refuses the error's own
+        # args, must not replace the error: it loses its PEP 249 class instead.
+        return error
     return translated
 
 

@@ -435,6 +435,36 @@ def test_errors_leave_no_reference_cycle():
     assert unreachable == 0
 
 
+def test_an_error_that_cannot_be_rebuilt_is_raised_unchanged(monkeypatch):
+    # As if a binding error gained a constructor that refuses its own args.
+    class Refusing(hawdb.exceptions.ParseError, dbapi.ProgrammingError):
+        def __init__(self, message, position):
+            super().__init__(message, position)
+
+    monkeypatch.setitem(dbapi._ENGINE_ERRORS, hawdb.exceptions.ParseError, Refusing)
+    connection = hawdb.connect()
+    cursor = connection.cursor()
+
+    def fail():
+        try:
+            cursor.execute("SELEC 1")
+        except dbapi.Error as error:
+            return error
+
+    gc.collect()
+    gc.disable()
+    try:
+        error = fail()
+        unreachable = gc.collect()
+    finally:
+        gc.enable()
+        connection.close()
+    assert type(error) is hawdb.exceptions.ParseError
+    # The failed construction is neither chained to it nor left in a cycle.
+    assert error.__context__ is None
+    assert unreachable == 0
+
+
 def test_commit_publishes_and_rollback_discards(connect):
     connection = connect()
     assert not connection.autocommit
