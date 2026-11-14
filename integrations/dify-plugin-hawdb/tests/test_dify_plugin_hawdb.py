@@ -23,8 +23,10 @@ server or plugin daemon is involved.
 
 import base64
 import binascii
+import gc
 import importlib.metadata
 import importlib.util
+import inspect
 import json
 import os
 import select
@@ -317,8 +319,12 @@ def longest_line(lines: list[str]) -> int:
 
 def assert_closed(path: Path) -> None:
     """The plugin holds no handle: another handle can run a statement."""
-    with hawdb.open(str(path)) as db:
-        db.execute("UNWIND [0] AS ready RETURN ready").fetchall()
+    db = hawdb.open(str(path))
+    try:
+        with db:
+            db.execute("UNWIND [0] AS ready RETURN ready").fetchall()
+    finally:
+        del db
 
 
 @pytest.fixture
@@ -989,11 +995,33 @@ def test_a_database_another_handle_is_using_is_a_tool_error(
 ) -> None:
     credentials = credentials_for(chunks)
     statement = "MATCH (c:Chunk) RETURN count(c) AS n"
-    with hawdb.open(str(chunks)) as other:
-        other.execute(statement).fetchall()
-        error = tool_error(cypher(plugin, credentials, statement))
-        assert error["error_type"] == "BranchError"
-        assert "busy" in error["message"]
+
+    def busy_probe() -> None:
+        # Diagnostic and exception frames can outlive the context manager.
+        # Model that retention, then collect this frame on a pool worker.
+        retained_frame = inspect.currentframe()
+        assert retained_frame is not None
+        other = hawdb.open(str(chunks))
+        try:
+            with other:
+                other.execute(statement).fetchall()
+                error = tool_error(cypher(plugin, credentials, statement))
+                assert error["error_type"] == "BranchError"
+                assert "busy" in error["message"]
+        finally:
+            # A closed PyO3 Database is still bound to its creating thread.
+            del other
+
+    pool = gevent.get_hub().threadpool
+    pool.apply(lambda: None)
+    automatic_gc = gc.isenabled()
+    try:
+        gc.disable()
+        busy_probe()
+        pool.apply(gc.collect)
+    finally:
+        if automatic_gc:
+            gc.enable()
     assert tool_json(cypher(plugin, credentials, statement))["rows"] == [{"n": 4}]
 
 
